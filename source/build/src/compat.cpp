@@ -20,9 +20,12 @@
 #endif
 #endif
 
-#if defined __linux || defined EDUKE32_BSD
+#if defined __linux || defined EDUKE32_BSD || defined EDUKE32_IOS
 #include <libgen.h>  // for dirname()
 #include <pwd.h>     // for getpwuid()
+#endif
+#if defined EDUKE32_IOS
+#include <mach-o/dyld.h>  // for _NSGetExecutablePath()
 #endif
 #if defined EDUKE32_BSD
 # include <limits.h> // for PATH_MAX
@@ -181,6 +184,16 @@ char *Bgetappdir(void)
         // on Linux, dirname() will modify buf2 (cutting off executable name) and return it
         // on FreeBSD it seems to use some internal buffer instead.. anyway, just strdup()
         dir = Xstrdup(dirname(buf2));
+    }
+#elif defined EDUKE32_IOS
+    // Returns the .app bundle directory (where nblood.pk3 is bundled).
+    char     buf[BMAX_PATH]  = {0};
+    char     buf2[BMAX_PATH] = {0};
+    uint32_t bufsize         = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &bufsize) == 0)
+    {
+        Bstrncpy(buf2, buf, sizeof(buf2));
+        dir = Xstrdup(dirname(buf2));  // dirname() may modify its argument
     }
 #endif
 

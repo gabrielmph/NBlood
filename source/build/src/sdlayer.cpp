@@ -459,6 +459,12 @@ extern "C" int eduke32_android_main(int argc, char const *argv[]);
 int eduke32_android_main(int argc, char const *argv[])
 #elif defined GEKKO
 int SDL_main(int argc, char *argv[])
+#elif defined EDUKE32_IOS
+// SDL_MAIN_HANDLED (set in mutex.h) suppresses SDL's "#define main SDL_main",
+// so name the entry SDL_main ourselves with C linkage. libSDL2main's main()
+// shim then boots UIApplication and calls back into SDL_main via SDL_UIKitRunApp.
+extern "C" int SDL_main(int argc, char *argv[]);
+int SDL_main(int argc, char *argv[])
 #else
 int main(int argc, char *argv[])
 #endif
@@ -2347,6 +2353,177 @@ void handleevents_updatemousestate(uint8_t state)
 //   returns !0 if there was an important event worth checking (like quitting)
 //
 
+#ifdef EDUKE32_IOS
+// ---------------------------------------------------------------------------
+// Minimal on-screen virtual gamepad: translates multitouch into build-engine
+// keyboard/mouse input. Bindings target Blood's defaults (see _functio.h):
+//   left-side stick  -> W/A/S/D (move + strafe)
+//   right-side drag  -> relative mouse motion (turn/aim; gMouseAim is on)
+//   buttons          -> Fire (mouse1), Jump (Space), Use (E), Crouch (LCtrl),
+//                       Next Weapon (apostrophe)
+// Keys are injected via keySetState (writes keystatus[], which the CONTROL
+// layer reads as KB_KeyDown[]); Fire uses g_mouseBits bit 0 (mousedefaults[0]).
+// ---------------------------------------------------------------------------
+#include "scancodes.h"
+
+namespace {
+
+constexpr int  IOS_SC_APOSTROPHE = 0x28;   // Next_Weapon default key
+constexpr float IOS_LOOK_SENS    = 0.75f;  // mouse-look gain for right-side drag
+
+// Normalized (0..1) screen-space layout. Button radius is in screen-height
+// units (x distance is aspect-corrected at hit-test time).
+struct ios_button_t { float x, y, r; int sc; int mousebit; };
+const ios_button_t s_iosButtons[] = {
+    { 0.90f, 0.85f, 0.10f, -1,               0  },  // FIRE  (mouse button 1)
+    { 0.72f, 0.90f, 0.08f, sc_Space,         -1 },  // JUMP
+    { 0.90f, 0.58f, 0.08f, sc_E,             -1 },  // USE / OPEN
+    { 0.72f, 0.64f, 0.08f, sc_LeftControl,   -1 },  // CROUCH
+    { 0.93f, 0.16f, 0.07f, IOS_SC_APOSTROPHE,-1 },  // NEXT WEAPON
+};
+constexpr int IOS_NUM_BUTTONS = ARRAY_SSIZE(s_iosButtons);
+
+// Left-side movement pad.
+constexpr float IOS_DPAD_CX = 0.16f, IOS_DPAD_CY = 0.74f;
+constexpr float IOS_DPAD_DEAD = 0.045f;     // deadzone (normalized units)
+constexpr float IOS_LOOK_XMAX = 0.40f;      // x < this and not a button => dpad
+
+enum { IOS_ROLE_NONE, IOS_ROLE_DPAD, IOS_ROLE_LOOK, IOS_ROLE_BUTTON };
+struct ios_finger_t { SDL_FingerID id; bool active; int role; int btn; };
+ios_finger_t s_iosFingers[10];
+
+const int s_dpadSc[4] = { sc_W, sc_S, sc_A, sc_D };  // fwd, back, strafeL, strafeR
+bool  s_dpadKey[4];
+float s_lookLastX, s_lookLastY;
+
+void ios_pressSc(int sc, int state)
+{
+    if (state)
+    {
+        if (!keyGetState(sc) && keypresscallback)
+            keypresscallback(sc, 1);
+        keySetState(sc, 1);
+    }
+    else
+    {
+        keySetState(sc, 0);
+        if (keypresscallback)
+            keypresscallback(sc, 0);
+    }
+}
+
+void ios_setButton(const ios_button_t *b, int state)
+{
+    if (b->mousebit >= 0)
+    {
+        if (state) g_mouseBits |= (1 << b->mousebit);
+        else       g_mouseBits &= ~(1 << b->mousebit);
+        if (g_mouseCallback)
+            g_mouseCallback(b->mousebit + 1, state);
+    }
+    else
+        ios_pressSc(b->sc, state);
+}
+
+void ios_updateDpad(float nx, float ny)
+{
+    const float dx = nx - IOS_DPAD_CX;
+    const float dy = ny - IOS_DPAD_CY;
+    bool want[4] = { false, false, false, false };
+    if (dy < -IOS_DPAD_DEAD) want[0] = true;   // up    -> forward
+    if (dy >  IOS_DPAD_DEAD) want[1] = true;   // down  -> back
+    if (dx < -IOS_DPAD_DEAD) want[2] = true;   // left  -> strafe left
+    if (dx >  IOS_DPAD_DEAD) want[3] = true;   // right -> strafe right
+    for (int i = 0; i < 4; i++)
+        if (want[i] != s_dpadKey[i])
+        {
+            ios_pressSc(s_dpadSc[i], want[i]);
+            s_dpadKey[i] = want[i];
+        }
+}
+
+void ios_clearDpad(void)
+{
+    for (int i = 0; i < 4; i++)
+        if (s_dpadKey[i])
+        {
+            ios_pressSc(s_dpadSc[i], 0);
+            s_dpadKey[i] = false;
+        }
+}
+
+int ios_hitButton(float nx, float ny)
+{
+    const float aspect = (ydim > 0) ? (float)xdim / (float)ydim : 1.7778f;
+    for (int i = 0; i < IOS_NUM_BUTTONS; i++)
+    {
+        const float ddx = (nx - s_iosButtons[i].x) * aspect;
+        const float ddy = (ny - s_iosButtons[i].y);
+        if (ddx * ddx + ddy * ddy <= s_iosButtons[i].r * s_iosButtons[i].r)
+            return i;
+    }
+    return -1;
+}
+
+ios_finger_t *ios_findFinger(SDL_FingerID id, bool alloc)
+{
+    for (auto &f : s_iosFingers)
+        if (f.active && f.id == id)
+            return &f;
+    if (alloc)
+        for (auto &f : s_iosFingers)
+            if (!f.active) { f.active = true; f.id = id; f.role = IOS_ROLE_NONE; f.btn = -1; return &f; }
+    return nullptr;
+}
+
+void ios_handleTouchEvent(SDL_Event *ev)
+{
+    const float nx = ev->tfinger.x;   // already normalized 0..1
+    const float ny = ev->tfinger.y;
+
+    switch (ev->type)
+    {
+    case SDL_FINGERDOWN:
+    {
+        ios_finger_t *f = ios_findFinger(ev->tfinger.fingerId, true);
+        if (!f) break;
+        const int btn = ios_hitButton(nx, ny);
+        if (btn >= 0)            { f->role = IOS_ROLE_BUTTON; f->btn = btn; ios_setButton(&s_iosButtons[btn], 1); }
+        else if (nx < IOS_LOOK_XMAX) { f->role = IOS_ROLE_DPAD; ios_updateDpad(nx, ny); }
+        else                     { f->role = IOS_ROLE_LOOK; s_lookLastX = nx; s_lookLastY = ny; }
+        break;
+    }
+    case SDL_FINGERMOTION:
+    {
+        ios_finger_t *f = ios_findFinger(ev->tfinger.fingerId, false);
+        if (!f) break;
+        if (f->role == IOS_ROLE_DPAD)
+            ios_updateDpad(nx, ny);
+        else if (f->role == IOS_ROLE_LOOK)
+        {
+            g_mousePos.x += Blrintf((nx - s_lookLastX) * xdim * IOS_LOOK_SENS);
+            g_mousePos.y += Blrintf((ny - s_lookLastY) * ydim * IOS_LOOK_SENS);
+            s_lookLastX = nx;
+            s_lookLastY = ny;
+        }
+        break;
+    }
+    case SDL_FINGERUP:
+    {
+        ios_finger_t *f = ios_findFinger(ev->tfinger.fingerId, false);
+        if (!f) break;
+        if (f->role == IOS_ROLE_DPAD)        ios_clearDpad();
+        else if (f->role == IOS_ROLE_BUTTON) ios_setButton(&s_iosButtons[f->btn], 0);
+        f->active = false;
+        f->role   = IOS_ROLE_NONE;
+        break;
+    }
+    }
+}
+
+} // namespace
+#endif // EDUKE32_IOS
+
 int32_t handleevents_sdlcommon(SDL_Event *ev)
 {
     switch (ev->type)
@@ -2429,13 +2606,16 @@ int32_t handleevents_sdlcommon(SDL_Event *ev)
 #else
 # if SDL_MAJOR_VERSION >= 2
         case SDL_FINGERUP:
-            g_mouseClickState = MOUSE_RELEASED;
-            break;
         case SDL_FINGERDOWN:
-            g_mouseClickState = MOUSE_PRESSED;
         case SDL_FINGERMOTION:
+            // Keep the absolute "mouse" cursor + click state updated so the
+            // menus stay touch-navigable, then dispatch to the virtual gamepad
+            // for in-game controls.
             g_mouseAbs.x = Blrintf(ev->tfinger.x * xdim);
             g_mouseAbs.y = Blrintf(ev->tfinger.y * ydim);
+            if (ev->type == SDL_FINGERDOWN)     g_mouseClickState = MOUSE_PRESSED;
+            else if (ev->type == SDL_FINGERUP)  g_mouseClickState = MOUSE_RELEASED;
+            ios_handleTouchEvent(ev);
             break;
 # endif
 #endif

@@ -187,6 +187,15 @@ ifeq ($(PLATFORM),DARWIN)
     CXX := $(CROSS)clang++$(CROSS_SUFFIX)
 endif
 
+# iOS: use the iphoneos SDK clang directly (xcodebuild/Xcode IDE not required).
+ifeq ($(PLATFORM),IOS)
+    IOS_MIN ?= 16.0
+    IOS_SDK ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
+    IOS_CLANG ?= $(shell xcrun --sdk iphoneos --find clang)
+    CC := $(IOS_CLANG)
+    CXX := $(IOS_CLANG)
+endif
+
 COBJC := $(CC) -x objective-c
 COBJCXX := $(CXX) -x objective-c++
 L_CC := $(CC)
@@ -288,6 +297,9 @@ ifeq ($(PLATFORM),WINDOWS)
     endif
 else ifeq ($(PLATFORM),WII)
     IMPLICIT_ARCH := ppc
+else ifeq ($(PLATFORM),IOS)
+    IMPLICIT_ARCH := arm64
+    BITS := 64
 else ifeq ($(PLATFORM),$(filter $(PLATFORM),DINGOO GCW))
     IMPLICIT_ARCH := mipsel
 else
@@ -381,6 +393,23 @@ ifeq ($(PLATFORM),WINDOWS)
     override HAVE_GTK2 := 0
 else ifeq ($(PLATFORM),DARWIN)
     HAVE_GTK2 := 0
+else ifeq ($(PLATFORM),IOS)
+    # Software renderer only; no GL/Polymost, no NASM, no startup window, no
+    # multiplayer, no GTK. Optional codecs disabled for the first build to keep
+    # the cross-compiled dependency set minimal.
+    override USE_OPENGL := 0
+    override NETCODE := 0
+    override HAVE_GTK2 := 0
+    override NOASM := 1
+    override USE_LIBVPX := 0
+    override HAVE_FLAC := 0
+    override HAVE_VORBIS := 0
+    override HAVE_XMP := 0
+    override STARTUP_WINDOW := 0
+    override USE_PHYSFS := 0
+    override USE_MIMALLOC := 0
+    override SDL_STATIC := 1
+    SDL_TARGET := 2
 else ifeq ($(PLATFORM),WII)
     override USE_OPENGL := 0
     override NETCODE := 0
@@ -440,6 +469,12 @@ ifeq ($(RELEASE),0)
 else
     OPTLEVEL := 2
     LTO := 1
+endif
+
+# iOS: keep plain native objects in the archive (no LTO bitcode) so the final
+# ld64 link of the .app is straightforward.
+ifeq ($(PLATFORM),IOS)
+    override LTO := 0
 endif
 
 ifeq (0,$(CLANG))
@@ -531,6 +566,8 @@ else ifeq ($(PLATFORM),DARWIN)
     ifeq ($(BITS),64)
         ASFORMAT += 64
     endif
+else ifeq ($(PLATFORM),IOS)
+    COMMONFLAGS += -target arm64-apple-ios$(IOS_MIN) -isysroot $(IOS_SDK) -miphoneos-version-min=$(IOS_MIN)
 else ifeq ($(PLATFORM),WII)
     LIBOGC_INC := $(DEVKITPRO)/libogc/include
     LIBOGC_LIB := $(DEVKITPRO)/libogc/lib/wii
@@ -860,6 +897,12 @@ endif
 ifeq ($(PLATFORM),WINDOWS)
     COMPILERFLAGS += -Iplatform/Windows/include -Iplatform/Windows/include/SDL2
     LIBDIRS += -Lplatform/Windows/lib/$(BITS)
+else ifeq ($(PLATFORM),IOS)
+    # Headers for the cross-built static SDL2 (staged into the repo). The final
+    # link against libSDL2.a happens in the iOS app target, not here.
+    IOS_SDL_ROOT ?= platform/Apple/iOS/SDL2
+    COMPILERFLAGS += -I$(IOS_SDL_ROOT)/include
+    LIBDIRS += -L$(IOS_SDL_ROOT)/lib
 else ifeq ($(PLATFORM),DARWIN)
     ifneq ($(shell port --version &>/dev/null; echo $$?),127)
         LIBDIRS += -L/opt/local/lib
@@ -926,6 +969,10 @@ ifeq ($(RENDERTYPE),SDL)
         SDLCONFIG :=
     endif
 
+    ifeq ($(PLATFORM),IOS)
+        SDLCONFIG :=
+    endif
+
     ifneq ($(strip $(SDLCONFIG)),)
         ifeq ($(strip $(shell $(SDLCONFIG) --version $(DONT_PRINT_STDERR))),)
             override SDLCONFIG :=
@@ -962,7 +1009,14 @@ ifeq ($(RENDERTYPE),SDL)
             ifeq ($(SDL_TARGET),1)
                 COMPILERFLAGS += -D_GNU_SOURCE=1
             endif
-            COMPILERFLAGS += -D_REENTRANT -DSDL_USEFOLDER
+            ifeq ($(PLATFORM),IOS)
+                # Use plain "SDL.h" (resolved via -Iplatform/Apple/iOS/SDL2/include).
+                # Avoid SDL_USEFOLDER so sdl_inc.h skips <SDL2/SDL_syswm.h>, which is
+                # not meaningful on UIKit; it's already skipped on __APPLE__.
+                COMPILERFLAGS += -D_REENTRANT
+            else
+                COMPILERFLAGS += -D_REENTRANT -DSDL_USEFOLDER
+            endif
             LIBS += -l$(SDLNAME)
         endif
     endif

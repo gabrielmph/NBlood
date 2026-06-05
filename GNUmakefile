@@ -1295,6 +1295,7 @@ endif
     all \
     clang-tools \
     clean \
+    nblood-ios \
     printtools \
     printutils \
     rev \
@@ -1358,6 +1359,25 @@ endif
 endef
 
 $(foreach i,$(games),$(foreach j,$(roles),$(eval $(call BUILDRULE,$i,$j))))
+
+
+#### iOS: archive every Blood/engine object into one static library.
+# The iOS app target (clang or Xcode) links libnblood.a with -force_load plus
+# libSDL2.a and the system frameworks. No executable is linked here because an
+# iOS binary must be assembled into an .app bundle, which the packaging step does.
+# Defined via eval/call so the second-expansion of expandobjs resolves the same
+# way it does inside BUILDRULE.
+nblood-ios: libnblood.a | start
+	@$(call LL,$^)
+
+define IOSLIBRULE
+libnblood.a: $$(foreach i,$(call getdeps,blood,game),$$(call expandobjs,$$i))
+	$$(ARCHIVE_STATUS)
+	-$$(call RM,$$@)
+	$$(RECIPE_IF) $$(AR) rcs $$@ $$^ $$(RECIPE_RESULT_ARCHIVE)
+endef
+
+$(eval $(call IOSLIBRULE))
 
 
 #### Rules
@@ -1498,6 +1518,7 @@ clean: cleanduke3d cleansw cleanblood cleanrr cleanexhumed cleanwitchaven cleant
 	-$(call RMDIR,$(obj))
 	-$(call RM,$(ebacktrace_dll))
 	-$(call RM,$(voidwrap_lib))
+	-$(call RM,libnblood.a)
 
 printtools:
 	echo "$(addsuffix $(EXESUFFIX),$(tools_targets))"

@@ -105,6 +105,23 @@ void G_ExtPreInit(int32_t argc,char const * const * argv)
     GetModuleFileName(NULL,g_rootDir,BMAX_PATH);
     Bcorrectfilename(g_rootDir,1);
     //chdir(g_rootDir);
+#elif defined EDUKE32_IOS
+    // The launch cwd on iOS is the read-only "/". Use the app sandbox's
+    // Documents directory (exposed via iTunes/Files sharing) as the working and
+    // data directory: the user drops BLOOD.RFF etc. there, and config/saves are
+    // written there too. nblood.pk3 itself is found via the .app bundle search
+    // path added in G_ExtInit().
+    char *homedir = Bgethomedir();
+    if (homedir)
+    {
+        Bsnprintf(g_rootDir, BMAX_PATH, "%s/Documents", homedir);
+        Bmkdir(g_rootDir, S_IRWXU);  // normally already created by iOS
+        Bchdir(g_rootDir);
+        Xfree(homedir);
+    }
+    else
+        getcwd(g_rootDir, BMAX_PATH);
+    strcat(g_rootDir, "/");
 #else
     getcwd(g_rootDir,BMAX_PATH);
     strcat(g_rootDir,"/");
@@ -115,10 +132,14 @@ void G_ExtInit(void)
 {
     char cwd[BMAX_PATH];
 
-#ifdef EDUKE32_OSX
+#if defined EDUKE32_OSX || defined EDUKE32_IOS
+    // Add the .app bundle directory so bundled resources (nblood.pk3) are found.
     char *appdir = Bgetappdir();
-    addsearchpath(appdir);
-    Xfree(appdir);
+    if (appdir)
+    {
+        addsearchpath(appdir);
+        Xfree(appdir);
+    }
 #endif
 
     if (getcwd(cwd,BMAX_PATH) && Bstrcmp(cwd,"/") != 0)
@@ -146,6 +167,10 @@ void G_ExtInit(void)
 
 #if defined(_WIN32)
     if (!access("user_profiles_enabled", F_OK))
+#elif defined EDUKE32_IOS
+    // Keep everything in the Documents directory we already chdir'd into; do not
+    // redirect config/saves into a hidden ~/.config/nblood subfolder.
+    if (0)
 #else
     if (g_useCwd == 0 && access("user_profiles_disabled", F_OK))
 #endif
